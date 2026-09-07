@@ -182,6 +182,12 @@ namespace SilksongInspector
                 if (IsProbablyCorpseOrEffect(go.name))
                     continue;
 
+                // Only rendered enemies may enter the dataset. Off-screen
+                // (culled) actors are dropped, so passive bystanders like the
+                // Maestro never show up unless the game actually renders them.
+                if (!IsEnemyVisible(go))
+                    continue;
+
                 float dist = Vector3.Distance(hornetPos, pos);
                 if (dist > MaxTrackDistance)
                     continue;
@@ -490,7 +496,21 @@ namespace SilksongInspector
                 foreach (Collider2D c in e.GameObject.GetComponentsInChildren<Collider2D>(true))
                 {
                     if (!e.Colliders.Contains(c))
+                    {
                         e.Colliders.Add(c);
+
+                        // DIAGNOSTIC: dump every DamageHero-bearing child once so the
+                        // real hitbox names can be used to rebuild the whitelist.
+                        if (c.gameObject.GetComponent("DamageHero") != null)
+                        {
+                            Logger.LogInfo(
+                                $"DAMAGEHERO CHILD | owner:{e.Name} | goName:{c.gameObject.name} | " +
+                                $"trigger:{c.isTrigger} | enabled:{c.enabled} | " +
+                                $"path:{GetFullPath(c.transform)}"
+                            );
+                        }
+                    }
+
                     if (!e.ColliderMonos.ContainsKey(c))
                         e.ColliderMonos[c] = c.GetComponents<MonoBehaviour>();
                 }
@@ -538,26 +558,40 @@ namespace SilksongInspector
 
         private void RemoveEnemy(int id)
         {
-            if (!enemies.ContainsKey(id))
+            if (!enemies.TryGetValue(id, out EnemyState state))
                 return;
 
-            Logger.LogInfo($"ENEMY REMOVED | ID:{id} | {enemies[id].Name}");
+            // Determine the cause BEFORE removing tracking data.
+            // If the last observed HP was <= 0, treat this as a death; otherwise
+            // the object was removed/despawned without us observing HP reach zero.
+            int? lastHp = lastEnemyHp.TryGetValue(id, out int hp) ? hp : (int?)null;
+            bool diedFromDamage = lastHp.HasValue && lastHp.Value <= 0;
+
+            string kind = diedFromDamage ? "enemy_died" : "enemy_despawned";
+            frameEvents.Add(BuildEventJson(kind,
+                $"{{\"enemy\":\"{EscapeJson(state.Name)}\",\"enemy_id\":{id}," +
+                $"\"last_hp\":{(lastHp.HasValue ? lastHp.Value.ToString(CultureInfo.InvariantCulture) : "null")}}}"));
+
+            Logger.LogInfo(
+                $"{(diedFromDamage ? "ENEMY DIED" : "ENEMY DESPAWNED")} | " +
+                $"ID:{id} | {state.Name} | last_hp={(lastHp.HasValue ? lastHp.Value.ToString(CultureInfo.InvariantCulture) : "null")}"
+            );
 
             if (enemyBoxes.TryGetValue(id, out LineRenderer lr))
             {
-                if (lr != null)
-                    Object.Destroy(lr.gameObject);
+                if (lr != null) Object.Destroy(lr.gameObject);
                 enemyBoxes.Remove(id);
             }
 
             if (enemyLabels.TryGetValue(id, out TextMesh tm))
             {
-                if (tm != null)
-                    Object.Destroy(tm.gameObject);
+                if (tm != null) Object.Destroy(tm.gameObject);
                 enemyLabels.Remove(id);
             }
 
             enemies.Remove(id);
+            lastEnemyHp.Remove(id);
+            lastSnapshotEnemyHp.Remove(id);
         }
 
         private void ClearAllEnemies()
@@ -670,24 +704,52 @@ namespace SilksongInspector
                 if (col == null || !col.enabled)
                     continue;
 
-                // Already tracked as a child hazard of a known enemy? skip, avoid dupes.
+                // Anything already tracked as a child hazard of an enemy is not a
+                // standalone projectile. This check must happen before assigning the
+                // fallback "Environment" owner.
                 int id = go.GetInstanceID();
                 if (hazards.ContainsKey(id))
                     continue;
 
-                // If this object's own root/self is actually a tracked enemy body
-                // (i.e. this IS an enemy's own collider, not a separate hazard), skip —
-                // that's already drawn as the enemy box.
-                bool isTrackedEnemyBody = false;
+                // IMPORTANT: the standalone scan walks every Transform in the scene.
+                // A DamageHero collider belonging to an enemy child can therefore be
+                // encountered here before/after ScanChildHazards(). Previously only the
+                // enemy ROOT was excluded, so child attack hitboxes could be incorrectly
+                // registered as OWNER:Environment and then serialized as projectiles.
+                bool belongsToTrackedEnemy = false;
                 foreach (var pair in enemies)
                 {
-                    if (pair.Value.GameObject == go)
+                    EnemyState enemy = pair.Value;
+                    if (enemy == null || enemy.GameObject == null)
+                        continue;
+
+                    Transform enemyRoot = enemy.GameObject.transform;
+                    if (t == enemyRoot || t.IsChildOf(enemyRoot))
                     {
-                        isTrackedEnemyBody = true;
+                        belongsToTrackedEnemy = true;
                         break;
                     }
                 }
-                if (isTrackedEnemyBody)
+
+                if (belongsToTrackedEnemy)
+                    continue;
+
+                // Do not classify arbitrary scene DamageHero objects as projectiles.
+                // A Rigidbody2D by itself is NOT enough: background/environment objects
+                // can have physics components while remaining completely stationary.
+                // Require actual movement, or a very strong projectile name.
+                Rigidbody2D rb = go.GetComponent<Rigidbody2D>();
+                string lowerName = go.name.ToLowerInvariant();
+                bool projectileNamed =
+                    lowerName.Contains("projectile") ||
+                    lowerName.Contains("projectile(clone)") ||
+                    lowerName.Contains("shot(clone)") ||
+                    lowerName.Contains("bolt(clone)") ||
+                    lowerName.Contains("bullet(clone)") ||
+                    lowerName.Contains("missile(clone)");
+
+                bool moving = rb != null && rb.velocity.sqrMagnitude > 0.0025f;
+                if (!moving && !projectileNamed)
                     continue;
 
                 Vector3 pos = t.position;
@@ -888,11 +950,7 @@ namespace SilksongInspector
             if (deadIds != null)
             {
                 foreach (int id in deadIds)
-                {
-                    if (enemies.TryGetValue(id, out var st))
-                        Logger.LogInfo($"ENEMY REMOVED | ID:{id} | {st.Name}");
-                    enemies.Remove(id);
-                }
+                    RemoveEnemy(id);
             }
 
             // ---- Hazard (AoE) boxes — distinct color, drawn on top ----
@@ -2065,6 +2123,44 @@ namespace SilksongInspector
             return sb.ToString();
         }
 
+        private static string InferEnemyPhase(string animClip, bool attacking)
+        {
+            if (attacking)
+                return "attacking";
+
+            if (string.IsNullOrEmpty(animClip))
+                return "unknown";
+
+            string lower = animClip.ToLowerInvariant();
+
+            // These are intentionally broad temporary heuristics. Once real Silksong
+            // clip names are collected from DAMAGEHERO/anim_state logs, replace or
+            // extend them with the game's actual names.
+            if (lower.Contains("antic") || lower.Contains("windup") || lower.Contains("charge") ||
+                lower.Contains("telegraph") || lower.Contains("prep"))
+                return "windup";
+            if (lower.Contains("recover") || lower.Contains("cooldown"))
+                return "recovery";
+            if (lower.Contains("hurt") || lower.Contains("stagger") || lower.Contains("stun"))
+                return "staggered";
+            if (lower.Contains("death") || lower.Contains("die"))
+                return "dying";
+            if (lower.Contains("walk") || lower.Contains("run") || lower.Contains("move") || lower.Contains("chase"))
+                return "moving";
+            if (lower.Contains("idle"))
+                return "idle";
+
+            return "other";
+        }
+
+        private static bool? TryGetEnemyStaggered(GameObject go)
+        {
+            // Replace/extend these names after checking HEALTHFIELDS logs for the
+            // actual stagger/vulnerability field used by each enemy type.
+            return TryGetReflectedBoolValue(go,
+                "IsStaggered", "isStaggered", "staggered", "isVulnerable");
+        }
+
         private string BuildEnemyRecordJson(EnemyState enemy)
         {
             GameObject go = enemy.GameObject;
@@ -2085,15 +2181,23 @@ namespace SilksongInspector
             AppendVector2Field(sb, ref first, "velocity", velocity);
             AppendVector2Field(sb, ref first, "relative_position", relative);
             AppendFloatField(sb, ref first, "distance", enemy.Distance);
-            AppendIntNullableField(sb, ref first, "hp", TryGetHealthValue(go, "hp", "health", "currentHP", "currentHealth", "hitPoints", "life"));
-            AppendIntNullableField(sb, ref first, "max_hp", TryGetHealthValue(go, "max_hp", "maxHP", "maxHealth", "maxHitPoints", "maximumHealth"));
+            int? curHp = TryGetHealthValue(go, "hp", "health", "currentHP", "currentHealth", "hitPoints", "life");
+            int? maxHp = TryGetHealthValue(go, "max_hp", "maxHP", "maxHealth", "maxHitPoints", "maximumHealth");
+            bool? staggered = TryGetEnemyStaggered(go);
+
+            AppendIntNullableField(sb, ref first, "hp", curHp);
+            AppendIntNullableField(sb, ref first, "max_hp", maxHp);
+            AppendBoolField(sb, ref first, "downed", curHp.HasValue && curHp.Value <= 0);
+            AppendNullableBoolField(sb, ref first, "staggered", staggered);
             AppendStringField(sb, ref first, "state", state);
             AppendStringField(sb, ref first, "anim_state", animState);
             // Attack is true only when an actual DamageHero hitbox is currently
             // enabled and active. Do not infer it from generic enemy state/action
             // names because some enemies keep attack-related AI states active.
             bool attacking = HasActiveAttackCollider(enemy, out string attackSource);
+            string phase = InferEnemyPhase(animState, attacking);
             AppendBoolField(sb, ref first, "attacking", attacking);
+            AppendStringField(sb, ref first, "phase", phase);
             if (attacking)
                 AppendStringField(sb, ref first, "att_src", attackSource);
             AppendArrayField(sb, ref first, "colliders", BuildEnemyCollidersJson(enemy));
@@ -2262,6 +2366,13 @@ namespace SilksongInspector
             {
                 HazardState hazard = pair.Value;
                 if (hazard == null || hazard.GameObject == null || hazard.Transform == null)
+                    continue;
+
+                // The hazards dictionary contains BOTH enemy attack hitboxes and
+                // standalone projectiles. Only standalone hazards belong in the
+                // JSON "projectiles" array; enemy-owned attack hitboxes are already
+                // represented under their enemy record (attacking/att_src/colliders).
+                if (hazard.OwnerEnemyId != null)
                     continue;
 
                 if (!first)
