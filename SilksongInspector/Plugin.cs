@@ -15,7 +15,7 @@ namespace SilksongInspector
     [BepInPlugin(
         "com.vamsi.silksonginspector",
         "Silksong Inspector",
-        "1.9.0"
+        "2.0.0"
     )]
     public class Plugin : BaseUnityPlugin
     {
@@ -36,6 +36,7 @@ namespace SilksongInspector
         private bool sessionActive = false;
         private string currentSessionId;
         private string currentSessionFilePath;
+        private StreamWriter sessionWriter;
         private Transform hornet;
         private Vector3 hornetPos;
         private Vector3 lastHornetPos;
@@ -878,7 +879,7 @@ namespace SilksongInspector
                 }
 
                 UpdateLabel(label, BuildEnemyOverlayText(e));
-                label.color = (HasActiveAttackCollider(e) || IsLikelyAttacking(e.GameObject, GetVerifiedStateLabel(e.GameObject))) ? Color.red : targetColor;
+                label.color = HasActiveAttackCollider(e, out _) ? Color.red : targetColor;
 
                 float topY = e.Collider != null ? e.Collider.bounds.max.y : e.Transform.position.y + BoxPadding;
                 label.transform.position = new Vector3(e.Transform.position.x, topY + LabelYOffset, e.Transform.position.z);
@@ -1145,7 +1146,7 @@ namespace SilksongInspector
             Vector3 velocity = GetEnemyVelocity(enemy);
             Vector3 relative = enemy.Position - hornetPos;
             string state = GetVerifiedStateLabel(enemy.GameObject);
-            bool attacking = IsLikelyAttacking(enemy.GameObject, state);
+            bool attacking = HasActiveAttackCollider(enemy, out _);
             int? hp = TryGetHealthValue(enemy.GameObject, "hp", "health", "currentHP", "currentHealth", "hitPoints", "life");
             int? maxHp = TryGetHealthValue(enemy.GameObject, "max_hp", "maxHP", "maxHealth", "maxHitPoints", "maximumHealth");
 
@@ -1678,7 +1679,16 @@ namespace SilksongInspector
             sessionCounter++;
             currentSessionId = $"{DateTime.UtcNow:yyyyMMdd_HHmmss_fff}_{sessionCounter:000}";
             currentSessionFilePath = Path.Combine(OutputDirectory, $"session_{currentSessionId}.jsonl");
-            File.WriteAllText(currentSessionFilePath, string.Empty, new UTF8Encoding(false));
+
+            // Keep one buffered writer open for the entire session instead of
+            // opening and closing the JSONL file for every snapshot.
+            sessionWriter = new StreamWriter(
+                currentSessionFilePath,
+                false,
+                new UTF8Encoding(false),
+                65536
+            );
+            sessionWriter.AutoFlush = false;
 
             sessionStartTime = Time.realtimeSinceStartup;
             snapshotIndex = 0;
@@ -1694,6 +1704,23 @@ namespace SilksongInspector
                 return;
 
             Logger.LogInfo($"SESSION ENDED | {reason} | {currentSessionFilePath}");
+
+            try
+            {
+                if (sessionWriter != null)
+                {
+                    sessionWriter.Flush();
+                    sessionWriter.Dispose();
+                }
+            }
+            catch (Exception ex)
+            {
+                Logger.LogWarning($"SESSION WRITER CLOSE FAILED | {ex.Message}");
+            }
+            finally
+            {
+                sessionWriter = null;
+            }
 
             sessionActive = false;
             currentSessionId = null;
@@ -1734,7 +1761,15 @@ namespace SilksongInspector
             try
             {
                 string json = BuildSnapshotJson(now);
-                File.AppendAllText(currentSessionFilePath, json + Environment.NewLine, new UTF8Encoding(false));
+
+                if (sessionWriter == null)
+                {
+                    Logger.LogWarning("SNAPSHOT WRITE SKIPPED | session writer is null");
+                    return;
+                }
+
+                sessionWriter.Write(json);
+                sessionWriter.Write(Environment.NewLine);
                 snapshotIndex++;
                 frameEvents.Clear();
                 UpdateSnapshotBaselines();
@@ -2054,7 +2089,13 @@ namespace SilksongInspector
             AppendIntNullableField(sb, ref first, "max_hp", TryGetHealthValue(go, "max_hp", "maxHP", "maxHealth", "maxHitPoints", "maximumHealth"));
             AppendStringField(sb, ref first, "state", state);
             AppendStringField(sb, ref first, "anim_state", animState);
-            AppendBoolField(sb, ref first, "attacking", HasActiveAttackCollider(enemy) || IsLikelyAttacking(go, state));
+            // Attack is true only when an actual DamageHero hitbox is currently
+            // enabled and active. Do not infer it from generic enemy state/action
+            // names because some enemies keep attack-related AI states active.
+            bool attacking = HasActiveAttackCollider(enemy, out string attackSource);
+            AppendBoolField(sb, ref first, "attacking", attacking);
+            if (attacking)
+                AppendStringField(sb, ref first, "att_src", attackSource);
             AppendArrayField(sb, ref first, "colliders", BuildEnemyCollidersJson(enemy));
 
             sb.Append('}');
@@ -2086,46 +2127,50 @@ namespace SilksongInspector
             return "none";
         }
 
-        private static bool HasActiveAttackCollider(EnemyState e)
+        private static bool HasActiveAttackCollider(EnemyState e, out string source)
         {
+            source = null;
+            if (e == null)
+                return false;
+
             foreach (Collider2D c in e.Colliders)
             {
                 if (c == null || c.gameObject == null)
                     continue;
 
-                if (e.ColliderMonos.TryGetValue(c, out MonoBehaviour[] monos))
-                {
-                    foreach (MonoBehaviour m in monos)
-                    {
-                        if (m == null || !m.enabled)
-                            continue;
+                GameObject go = c.gameObject;
+                string nameLower = go.name.ToLowerInvariant();
 
-                        string t = m.GetType().Name.ToLowerInvariant();
-                        if (t.Contains("damager") || t.Contains("attack") || t.Contains("hazard") ||
-                            t.Contains("hurt") || t.Contains("harm"))
-                            return true;
-                    }
-                }
-
-                if (!c.enabled || !c.gameObject.activeInHierarchy)
+                // An attack must be a collider whose NAME matches an actual attack
+                // hitbox. Some enemies keep a permanently-active DamageHero collider
+                // under a non-attack name (body/sensor/aura); those are not attacks.
+                if (!IsRelevantEnemyCollider(c))
                     continue;
 
-                string n = c.gameObject.name.ToLowerInvariant();
-                if (n.Contains("ally"))
+                // AI awareness/utility triggers are not attacks.
+                if (nameLower.Contains("range") ||
+                    nameLower.Contains("alert") ||
+                    nameLower.Contains("evade") ||
+                    nameLower.Contains("wake") ||
+                    nameLower.Contains("unalert") ||
+                    nameLower.Contains("patrol") ||
+                    // Persistent body-contact hurtbox (touch damage), not a swing.
+                    nameLower.Contains("body"))
                     continue;
 
-                string tag = c.gameObject.tag;
-                if (!string.IsNullOrEmpty(tag))
-                {
-                    if (tag.IndexOf("attack", StringComparison.OrdinalIgnoreCase) >= 0 ||
-                        tag.IndexOf("hazard", StringComparison.OrdinalIgnoreCase) >= 0 ||
-                        tag.IndexOf("danger", StringComparison.OrdinalIgnoreCase) >= 0)
-                        return true;
-                }
+                // A DamageHero component can exist on a disabled hitbox waiting for
+                // the attack animation/state to activate it. Both checks are required.
+                if (!c.enabled || !go.activeInHierarchy)
+                    continue;
 
-                if (n.Contains("hit") || n.Contains("damager") || n.Contains("slash") || n.Contains("whip") ||
-                    n.Contains("stab") || n.Contains("punch") || n.Contains("kick") || n.Contains("jump"))
+                // The DamageHero component itself must be enabled, otherwise the
+                // hitbox is inert even if the collider/GameObject are active.
+                Behaviour damageHero = go.GetComponent("DamageHero") as Behaviour;
+                if (damageHero != null && damageHero.enabled)
+                {
+                    source = go.name;
                     return true;
+                }
             }
 
             return false;
@@ -2152,8 +2197,8 @@ namespace SilksongInspector
             int logged = 0;
             foreach (Collider2D c in e.Colliders)
             {
-                if (!IsRelevantEnemyCollider(c) || logged >= 10)
-                    continue;
+                if (logged >= 20)
+                    break;
 
                 if (!first)
                     sb.Append(',');
@@ -2388,23 +2433,6 @@ namespace SilksongInspector
                 return hazard.OwnerName;
 
             return string.IsNullOrEmpty(hazard.Name) ? "unknown" : hazard.Name;
-        }
-
-        private bool IsLikelyAttacking(GameObject go, string state)
-        {
-            if (!string.IsNullOrEmpty(state))
-            {
-                string lower = state.ToLowerInvariant();
-                if (lower.Contains("attack") || lower.Contains("windup") || lower.Contains("slash") || lower.Contains("strike") || lower.Contains("shoot"))
-                    return true;
-            }
-
-            string action = GetActorAction(go);
-            if (string.IsNullOrEmpty(action) || action == "unknown")
-                return false;
-
-            string lowerAction = action.ToLowerInvariant();
-            return lowerAction.Contains("attack") || lowerAction.Contains("windup") || lowerAction.Contains("slash") || lowerAction.Contains("strike") || lowerAction.Contains("shoot");
         }
 
         private int GetFacingSign(Transform target, Vector3 velocity)
